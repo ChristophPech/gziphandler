@@ -26,11 +26,25 @@ const DEFAULT_QVALUE = 1.0
 // Use poolIndex to covert a compression level to an index into gzipWriterPools.
 var gzipWriterPools [gzip.BestCompression - gzip.BestSpeed + 2]*sync.Pool
 
+var contentTypesAllowed map[string]bool
+
 func init() {
 	for i := gzip.BestSpeed; i <= gzip.BestCompression; i++ {
 		addLevelPool(i)
 	}
 	addLevelPool(gzip.DefaultCompression)
+
+	contentTypesAllowed = make(map[string]bool)
+	contentTypesAllowed["application/javascript"] = true
+	contentTypesAllowed["application/json"] = true
+	contentTypesAllowed["application/x-javascript"] = true
+	contentTypesAllowed["application/x-tar"] = true
+	contentTypesAllowed["image/svg+xml"] = true
+	contentTypesAllowed["text/css"] = true
+	contentTypesAllowed["text/html"] = true
+	contentTypesAllowed["text/plain"] = true
+	contentTypesAllowed["text/xml"] = true
+	contentTypesAllowed["text/csv"] = true
 }
 
 // poolIndex maps a compression level to its index into gzipWriterPools. It assumes that
@@ -55,28 +69,82 @@ func addLevelPool(level int) {
 	}
 }
 
+const (
+	WriteState_init = iota
+	WriteState_gzip
+	WriteState_plain
+)
+
+type internalWriter struct {
+	gw         *gzip.Writer
+	level      int
+	writeState int
+}
+
 // GzipResponseWriter provides an http.ResponseWriter interface, which gzips
 // bytes before writing them to the underlying response. This doesn't set the
 // Content-Encoding header, nor close the writers, so don't forget to do that.
 type GzipResponseWriter struct {
-	gw *gzip.Writer
 	http.ResponseWriter
+	iw *internalWriter
 }
 
 // Write appends data to the gzip writer.
 func (w GzipResponseWriter) Write(b []byte) (int, error) {
-	if _, ok := w.Header()["Content-Type"]; !ok {
-		// If content type is not set, infer it from the uncompressed body.
-		w.Header().Set("Content-Type", http.DetectContentType(b))
+	if w.iw.writeState == WriteState_init {
+		if _, ok := w.Header()["Content-Type"]; !ok {
+			// If content type is not set, infer it from the uncompressed body.
+			w.Header().Set("Content-Type", http.DetectContentType(b))
+		}
+		w.WriteHeader(http.StatusOK)
 	}
-	return w.gw.Write(b)
+
+	if w.iw.writeState != WriteState_gzip {
+		return w.ResponseWriter.Write(b)
+	}
+
+	return w.iw.gw.Write(b)
+}
+
+func (w GzipResponseWriter) WriteHeader(code int) {
+	if w.iw.writeState == WriteState_init {
+		ct, ok := w.Header()["Content-Type"]
+		if ok && len(ct) > 0 {
+			entry := ct[0]
+
+			semi := strings.Index(entry, ";")
+			if semi > 0 {
+				entry = entry[:semi]
+			}
+
+			ok, _ = contentTypesAllowed[entry]
+		}
+
+		if ok {
+			w.iw.writeState = WriteState_gzip
+		} else {
+			w.iw.writeState = WriteState_plain
+		}
+	}
+	if w.iw.writeState == WriteState_gzip {
+		// Bytes written during ServeHTTP are redirected to this gzip writer
+		// before being written to the underlying response.
+		gzw := gzipWriterPools[poolIndex(w.iw.level)].Get().(*gzip.Writer)
+		gzw.Reset(w.ResponseWriter)
+		w.iw.gw = gzw
+		w.Header().Set(contentEncoding, "gzip")
+	}
+
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // Flush flushes the underlying *gzip.Writer and then the underlying
 // http.ResponseWriter if it is an http.Flusher. This makes GzipResponseWriter
 // an http.Flusher.
 func (w GzipResponseWriter) Flush() {
-	w.gw.Flush()
+	if w.iw.writeState == WriteState_gzip {
+		w.iw.gw.Flush()
+	}
 	if fw, ok := w.ResponseWriter.(http.Flusher); ok {
 		fw.Flush()
 	}
@@ -107,15 +175,12 @@ func NewGzipLevelHandler(level int) (func(http.Handler) http.Handler, error) {
 			w.Header().Add(vary, acceptEncoding)
 
 			if acceptsGzip(r) {
-				// Bytes written during ServeHTTP are redirected to this gzip writer
-				// before being written to the underlying response.
-				gzw := gzipWriterPools[poolIndex(level)].Get().(*gzip.Writer)
-				defer gzipWriterPools[poolIndex(level)].Put(gzw)
-				gzw.Reset(w)
-				defer gzw.Close()
-
-				w.Header().Set(contentEncoding, "gzip")
-				h.ServeHTTP(GzipResponseWriter{gzw, w}, r)
+				iw := internalWriter{nil, level, WriteState_init}
+				h.ServeHTTP(GzipResponseWriter{w, &iw}, r)
+				if iw.gw != nil {
+					iw.gw.Close()
+					gzipWriterPools[poolIndex(level)].Put(iw.gw)
+				}
 			} else {
 				h.ServeHTTP(w, r)
 			}
